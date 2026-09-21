@@ -58,6 +58,66 @@ var (
 	loginRetryMaxWait = 2 * time.Minute
 )
 
+// idempotentMethods are the HTTP methods RFC 9110 defines as idempotent: a
+// re-send is indistinguishable from a single send, so a transparent retry
+// cannot duplicate a resource. POST (and PATCH) are deliberately absent — the
+// UniFi API uses POST both for creates (/rest/<type>) and for side-effecting
+// commands (/cmd/<mgr>), neither of which is safe to replay.
+var idempotentMethods = []string{
+	http.MethodGet,
+	http.MethodHead,
+	http.MethodOptions,
+	http.MethodTrace,
+	http.MethodPut,
+	http.MethodDelete,
+}
+
+// isIdempotentMethod reports whether a request using method may be transparently
+// re-sent. An unknown or empty method is treated as non-idempotent: when the
+// method cannot be established, not retrying is the safe direction.
+func isIdempotentMethod(method string) bool {
+	return slices.Contains(idempotentMethods, strings.ToUpper(method))
+}
+
+// respIsIdempotent reports whether the request that produced resp may be
+// re-sent. A response with no attached request is treated as non-idempotent.
+func respIsIdempotent(resp *http.Response) bool {
+	if resp == nil || resp.Request == nil {
+		return false
+	}
+	return isIdempotentMethod(resp.Request.Method)
+}
+
+const (
+	// errorBodyReadLimit bounds how much of a failed response body is read in
+	// order to summarize it. Enough for a controller error document to still
+	// parse as JSON (and so be redacted), without slurping an arbitrary body.
+	errorBodyReadLimit = 8192
+	// errorBodySummaryMax bounds how much of that summary reaches the error
+	// message.
+	errorBodySummaryMax = 512
+)
+
+// summarizeErrorBody renders a bounded, single-line, secret-free snippet of a
+// failed response body for inclusion in an error message. Controller error
+// documents are JSON, so they are run through the same redaction used for
+// request payloads; anything else is included verbatim (bounded).
+func summarizeErrorBody(b []byte) string {
+	if len(bytes.TrimSpace(b)) == 0 {
+		return ""
+	}
+	s := redactSensitivePayload(b)
+	if s == "" || s == "[non-JSON payload omitted]" || s == "[payload omitted]" {
+		// e.g. an HTML error page from a reverse proxy — still worth seeing.
+		s = string(b)
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > errorBodySummaryMax {
+		s = string(r[:errorBodySummaryMax]) + "…(truncated)"
+	}
+	return s
+}
+
 // Config holds all configuration for creating a new ApiClient.
 type Config struct {
 	BaseURL        string
@@ -107,6 +167,16 @@ func New(ctx context.Context, cfg *Config) (*ApiClient, error) {
 			}
 			return true, nil
 		}
+		// A 5xx is only safely retried for idempotent methods.
+		// retryablehttp's DefaultRetryPolicy retries every 5xx regardless of
+		// method, so a POST that partially succeeded before the controller
+		// errored was re-sent for the whole retry budget — observed against
+		// Network 10.6.101 as five POSTs to /rest/networkconf, each able to
+		// create a duplicate object. Hand the 5xx straight back instead; the
+		// caller sees the controller's own error on the first attempt.
+		if resp != nil && resp.StatusCode >= 500 && !respIsIdempotent(resp) {
+			return false, nil
+		}
 		return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
 	}
 
@@ -117,12 +187,23 @@ func New(ctx context.Context, cfg *Config) (*ApiClient, error) {
 		if resp != nil && resp.StatusCode == http.StatusTooManyRequests && err == nil {
 			return resp, nil
 		}
+		// Carry the last status code (and a snippet of the controller's body)
+		// into the error. Without it the only thing a caller saw was "giving up
+		// after N attempt(s)" — a reproducible 500 was then visible only under
+		// TF_LOG=DEBUG.
+		var detail string
 		if resp != nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyReadLimit))
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
+			detail = fmt.Sprintf(" (last status: %s", strings.TrimSpace(resp.Status))
+			if snippet := summarizeErrorBody(body); snippet != "" {
+				detail += "; body: " + snippet
+			}
+			detail += ")"
 		}
 		if err == nil {
-			err = fmt.Errorf("giving up after %d attempt(s)", numTries)
+			err = fmt.Errorf("giving up after %d attempt(s)%s", numTries, detail)
 		}
 		return nil, err
 	}
